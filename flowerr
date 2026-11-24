@@ -1,0 +1,649 @@
+import math
+import os
+import random
+import shutil
+import sys
+import time
+
+MESSAGE = ""  
+PALETTE = "stargazer"  
+ROTATION_SPEED = 0.55  
+USE_DARK_BG = True     
+FPS = 24
+
+PALETTES = {
+    "stargazer": {
+        "throat": (175, 240, 110),
+        "inner": (255, 70, 165),
+        "mid": (255, 130, 200),
+        "edge": (255, 232, 246),
+        "freckle": (175, 20, 85),
+        "anther": (255, 175, 40),
+        "anther_hi": (255, 235, 110),
+        "accent_inner": (215, 105, 255),
+        "accent_edge": (255, 215, 245),
+        "msg": (255, 105, 165),
+    },
+    "white": {
+        "throat": (185, 245, 120),
+        "inner": (215, 230, 245),
+        "mid": (238, 244, 255),
+        "edge": (255, 255, 255),
+        "freckle": (175, 210, 155),
+        "anther": (255, 165, 35),
+        "anther_hi": (255, 230, 95),
+        "accent_inner": (195, 220, 255),
+        "accent_edge": (255, 255, 255),
+        "msg": (255, 120, 175),
+    },
+    "tiger": {
+        "throat": (255, 225, 85),
+        "inner": (255, 95, 40),
+        "mid": (255, 150, 50),
+        "edge": (255, 220, 125),
+        "freckle": (125, 22, 15),
+        "anther": (220, 55, 35),
+        "anther_hi": (255, 195, 70),
+        "accent_inner": (255, 120, 75),
+        "accent_edge": (255, 235, 155),
+        "msg": (255, 135, 105),
+    },
+    "violet": {
+        "throat": (150, 245, 185),
+        "inner": (165, 85, 255),
+        "mid": (205, 145, 255),
+        "edge": (240, 225, 255),
+        "freckle": (90, 35, 185),
+        "anther": (255, 195, 65),
+        "anther_hi": (255, 240, 145),
+        "accent_inner": (255, 115, 200),
+        "accent_edge": (245, 220, 255),
+        "msg": (235, 125, 255),
+    },
+}
+
+BG_RGB = (24, 28, 38)
+ASPECT = 2.0  
+
+def clamp(v, lo, hi):
+    return lo if v < lo else (hi if v > hi else v)
+
+def lerp(a, b, t):
+    return a + (b - a) * t
+
+def smoothstep(t):
+    t = clamp(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+def lerp_rgb(c1, c2, t):
+    t = clamp(t, 0.0, 1.0)
+    return (
+        int(c1[0] + (c2[0] - c1[0]) * t),
+        int(c1[1] + (c2[1] - c1[1]) * t),
+        int(c1[2] + (c2[2] - c1[2]) * t),
+    )
+
+def scale_rgb(c, factor):
+    return (
+        int(clamp(c[0] * factor, 0, 255)),
+        int(clamp(c[1] * factor, 0, 255)),
+        int(clamp(c[2] * factor, 0, 255)),
+    )
+
+def vec_norm(v):
+    length = math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
+    if length < 1e-9:
+        return (0.0, -1.0, 0.0)
+    return (v[0] / length, v[1] / length, v[2] / length)
+
+def vec_cross(a, b):
+    return (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+
+def project(x, y, z, rot_c, rot_s, cx, cy, unit):
+    rx = x * rot_c + z * rot_s
+    rz = -x * rot_s + z * rot_c
+    cam_dist = 4.2
+    persp = cam_dist / max(0.8, cam_dist - rz)
+    sx = cx + rx * persp * unit * ASPECT
+    sy = cy + y * persp * unit
+    depth_shade = clamp(0.62 + 0.40 * ((rz + 0.85) / 1.70), 0.45, 1.08)
+    return sx, sy, rz, depth_shade
+
+class Canvas:
+    def __init__(self, w, h):
+        self.w = w
+        self.h = h
+        self.chars = [" "] * (w * h)
+        self.colors = [None] * (w * h)
+        self.zbuf = [-1e9] * (w * h)
+
+    def put(self, x, y, ch, rgb, z=0.0):
+        ix = int(round(x))
+        iy = int(round(y))
+        if 0 <= ix < self.w and 0 <= iy < self.h:
+            idx = iy * self.w + ix
+            if z >= self.zbuf[idx]:
+                self.zbuf[idx] = z
+                self.chars[idx] = ch
+                self.colors[idx] = rgb
+
+    def render(self):
+        bg_esc = f"\x1b[48;2;{BG_RGB[0]};{BG_RGB[1]};{BG_RGB[2]}m" if USE_DARK_BG else ""
+        lines = []
+        w = self.w
+        chars = self.chars
+        colors = self.colors
+        for y in range(self.h):
+            row_start = y * w
+            out = [bg_esc] if bg_esc else []
+            last_rgb = None
+            for x in range(w):
+                idx = row_start + x
+                ch = chars[idx]
+                rgb = colors[idx]
+                if ch == " " or rgb is None:
+                    out.append(" ")
+                else:
+                    if rgb != last_rgb:
+                        out.append(f"\x1b[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m")
+                        last_rgb = rgb
+                    out.append(ch)
+            lines.append("".join(out))
+        return "\x1b[H" + "\n".join(lines) + "\x1b[0m"
+
+def make_particles():
+    rng = random.Random(42)
+    stars = [
+        (0.89, 0.09, 0.0, (95, 255, 175)),
+        (0.11, 0.80, 2.1, (95, 255, 175)),
+        (0.14, 0.14, 4.0, (130, 225, 255)),
+    ]
+    hearts = [
+        {"x": 0.11, "y": 0.22, "speed": 0.018, "phase": 0.2},
+        {"x": 0.12, "y": 0.72, "speed": 0.015, "phase": 2.4},
+        {"x": 0.87, "y": 0.60, "speed": 0.017, "phase": 4.1},
+        {"x": 0.84, "y": 0.24, "speed": 0.013, "phase": 1.3},
+    ]
+    sparkles = []
+    for _ in range(42):
+        sx = rng.uniform(0.03, 0.97)
+        sy = rng.uniform(0.04, 0.90)
+        if 0.26 < sx < 0.74 and 0.24 < sy < 0.76:
+            continue
+        sparkles.append((sx, sy, rng.uniform(0, 6.28), rng.choice([".", "o", "*", "+"])))
+    drifters = []
+    for _ in range(10):
+        drifters.append({
+            "x": rng.uniform(0.05, 0.95),
+            "y": rng.uniform(0.05, 0.82),
+            "vx": rng.uniform(0.008, 0.018),
+            "phase": rng.uniform(0, 6.28),
+            "ch": rng.choice(["<", ">", "o"]),
+            "color": rng.choice([(255, 115, 155), (255, 175, 215), (255, 210, 95)]),
+        })
+    return stars, hearts, sparkles, drifters
+
+
+def draw_stem_3d(cv, p0, p1, p2, progress, rot_c, rot_s, cx, cy, unit):
+    if progress <= 0.0:
+        return
+    steps = max(22, int(unit * 2.6))
+    max_i = int(steps * clamp(progress, 0.0, 1.0))
+    prev_sx, prev_sy = None, None
+    for i in range(max_i + 1):
+        t = i / steps
+        mt = 1.0 - t
+        x = mt * mt * p0[0] + 2 * mt * t * p1[0] + t * t * p2[0]
+        y = mt * mt * p0[1] + 2 * mt * t * p1[1] + t * t * p2[1]
+        z = mt * mt * p0[2] + 2 * mt * t * p1[2] + t * t * p2[2]
+
+        sx, sy, rz, shade = project(x, y, z, rot_c, rot_s, cx, cy, unit)
+        if prev_sx is not None:
+            dx = sx - prev_sx
+            dy = sy - prev_sy
+            slope = dx / (abs(dy) + 1e-4)
+            if slope < -0.6:
+                ch = "\\"
+            elif slope > 0.6:
+                ch = "/"
+            else:
+                ch = "|" if i % 4 else "i"
+        else:
+            ch = "|"
+        prev_sx, prev_sy = sx, sy
+
+        rgb = scale_rgb(lerp_rgb((70, 165, 110), (140, 235, 165), t), shade)
+        cv.put(sx, sy, ch, rgb, 5.0 + rz)
+        if t < 0.5:
+            cv.put(sx + 1, sy, ch, scale_rgb(rgb, 0.8), 4.98 + rz)
+
+
+def draw_v_foliage_3d(cv, base, progress, t_now, rot_c, rot_s, cx, cy, unit):
+    """3D tapered V-cone greenery and arching lance-shaped lily leaves."""
+    if progress <= 0.01:
+        return
+
+    # 1. 3D Cone of radiating emerald stems/fillers around the bouquet
+    num_rays = 22
+    steps = max(14, int(unit * 1.35))
+    for idx in range(num_rays):
+        ang = (idx / num_rays) * math.tau
+        ca, sa = math.cos(ang), math.sin(ang)
+        top_r = lerp(0.42, 0.62, (idx % 3) / 2.0) * progress
+        top_y = base[1] - lerp(0.62, 0.80, (idx % 2)) * progress
+        prev_sx, prev_sy = None, None
+        for s in range(1, steps + 1):
+            u = s / steps
+            r = top_r * (u ** 0.92)
+            x = base[0] + ca * r
+            y = lerp(base[1], top_y, u)
+            z = base[2] + sa * r
+            sx, sy, rz, shade = project(x, y, z, rot_c, rot_s, cx, cy, unit)
+            if prev_sx is not None:
+                slope = (sx - prev_sx) / (abs(sy - prev_sy) + 1e-4)
+                ch = "\\" if slope < -0.5 else ("/" if slope > 0.5 else ("|" if s % 2 else "+"))
+            else:
+                ch = "|"
+            prev_sx, prev_sy = sx, sy
+
+            rgb = scale_rgb(lerp_rgb((75, 170, 112), (145, 240, 170), u), shade)
+            if (idx * 7 + s * 13 + int(t_now * 3)) % 27 == 0:
+                rgb = scale_rgb((195, 255, 200), shade)
+            cv.put(sx, sy, ch, rgb, 4.95 + rz)
+
+    # 2. 8 Graceful 3D arching lance-shaped lily leaves spaced evenly around 360 deg
+    num_leaves = 8
+    leaf_steps = max(14, int(unit * 1.5))
+    max_s = int(leaf_steps * progress)
+    for i in range(num_leaves):
+        ang = (i / num_leaves) * math.tau + 0.25
+        ca, sa = math.cos(ang), math.sin(ang)
+        # Perpendicular horizontal vector for leaf width
+        pa, psa = -sa, ca
+
+        reach = 0.84 if i % 2 == 0 else 0.68
+        tip_y = -0.08 if i % 2 == 0 else 0.14
+        p0 = (base[0] + ca * 0.06, base[1] - 0.18, base[2] + sa * 0.06)
+        p1 = (base[0] + ca * (reach * 0.58), lerp(p0[1], tip_y, 0.55) - 0.14, base[2] + sa * (reach * 0.58))
+        p2 = (base[0] + ca * reach, tip_y, base[2] + sa * reach)
+
+        for s in range(max_s + 1):
+            u = s / leaf_steps
+            mt = 1.0 - u
+            cx3 = mt * mt * p0[0] + 2 * mt * u * p1[0] + u * u * p2[0]
+            cy3 = mt * mt * p0[1] + 2 * mt * u * p1[1] + u * u * p2[1]
+            cz3 = mt * mt * p0[2] + 2 * mt * u * p1[2] + u * u * p2[2]
+
+            half_w = math.sin(u * math.pi) * 0.06
+            base_col = lerp_rgb((65, 175, 110), (155, 245, 160), u)
+
+            for wi in (-1, 0, 1):
+                if wi != 0 and half_w < 0.022:
+                    continue
+                off = wi * half_w
+                sx, sy, rz, shade = project(
+                    cx3 + pa * off, cy3, cz3 + psa * off, rot_c, rot_s, cx, cy, unit
+                )
+                ch = "=" if (wi == 0 and half_w > 0.032) else ("~" if u > 0.72 else "-")
+                rgb = scale_rgb(base_col, shade * (1.0 if wi == 0 else 0.85))
+                cv.put(sx, sy, ch, rgb, 5.05 + rz)
+
+
+def draw_lily_3d(cv, center, axis, size, bloom, pal, t_now, rot_c, rot_s, cx, cy, unit, accent=False):
+    """Draw a true 3D 6-petal curved lily trumpet with freckles and arching stamens."""
+    if bloom <= 0.03:
+        return
+
+    fx, fy, fz = center
+    fwd = vec_norm(axis)
+    ref = (0.0, 0.0, 1.0) if abs(fwd[1]) > 0.94 else (0.0, -1.0, 0.0)
+    right = vec_norm(vec_cross(ref, fwd))
+    up = vec_norm(vec_cross(fwd, right))
+
+    petal_len = size * (0.34 + 0.66 * bloom)
+    max_w = petal_len * (0.18 + 0.14 * bloom)
+
+    inner_col = pal["accent_inner"] if accent else pal["inner"]
+    mid_col = pal["mid"]
+    edge_col = pal["accent_edge"] if accent else pal["edge"]
+    throat_col = pal["throat"]
+    freckle_col = pal["freckle"]
+
+    u_steps = clamp(int(petal_len * unit * 2.5), 11, 22)
+    shimmer_tick = int(t_now * 4.0)
+
+    for k in range(6):
+        phi = k * (math.pi / 3.0)
+        is_inner = (k % 2 == 1)
+        cphi, sphi = math.cos(phi), math.sin(phi)
+
+        rad = (
+            right[0] * cphi + up[0] * sphi,
+            right[1] * cphi + up[1] * sphi,
+            right[2] * cphi + up[2] * sphi,
+        )
+        tan = (
+            -right[0] * sphi + up[0] * cphi,
+            -right[1] * sphi + up[1] * cphi,
+            -right[2] * sphi + up[2] * cphi,
+        )
+
+        p_len = petal_len * (0.96 if is_inner else 1.04)
+        p_w = max_w * (1.06 if is_inner else 0.94)
+        layer_off = 0.018 if is_inner else 0.0
+
+        for ui in range(1, u_steps + 1):
+            u = ui / u_steps
+            flare = lerp(0.22, 1.04, bloom)
+            r_dist = p_len * flare * (u ** 0.88)
+            f_dist = p_len * (
+                0.52 * math.sin(u * math.pi * 0.78) * (1.12 - 0.35 * bloom)
+                - 0.25 * bloom * (u ** 2.6)
+            ) + layer_off
+
+            half_w = p_w * (u ** 0.62) * ((1.0 - u) ** 0.82) * 2.85
+            n_half = clamp(int(math.ceil(half_w * unit * ASPECT * 1.15)), 1, 7)
+
+           
+            bx = fx + rad[0] * r_dist + fwd[0] * f_dist
+            by = fy + rad[1] * r_dist + fwd[1] * f_dist
+            bz = fz + rad[2] * r_dist + fwd[2] * f_dist
+
+            for vi in range(-n_half, n_half + 1):
+                v = vi / n_half
+                edge_ratio = abs(v)
+                cup = -0.14 * half_w * (1.0 - v * v)
+                px = bx + tan[0] * (v * half_w) + fwd[0] * cup
+                py = by + tan[1] * (v * half_w) + fwd[1] * cup
+                pz = bz + tan[2] * (v * half_w) + fwd[2] * cup
+
+                sx, sy, rz, shade = project(px, py, pz, rot_c, rot_s, cx, cy, unit)
+
+                if u < 0.22:
+                    rgb = lerp_rgb(throat_col, inner_col, u / 0.22)
+                    ch = "+" if u < 0.13 else "o"
+                else:
+                    rim_t = clamp(edge_ratio * 0.85 + max(0.0, u - 0.66) * 1.55, 0.0, 1.0)
+                    if rim_t < 0.5:
+                        rgb = lerp_rgb(inner_col, mid_col, rim_t * 2.0)
+                    else:
+                        rgb = lerp_rgb(mid_col, edge_col, (rim_t - 0.5) * 2.0)
+                    cell_hash = (int(u * 13) * 37 + int((v + 2.0) * 11) * 19 + k * 7) % 13
+                    if 0.23 <= u <= 0.66 and edge_ratio < 0.58 and cell_hash == 0:
+                        rgb = freckle_col
+                        ch = ":"
+                    elif u > 0.88:
+                        ch = "*" if (ui + vi + shimmer_tick) % 7 == 0 else "."
+                    elif edge_ratio > 0.72:
+                        ch = "o" if (ui + vi) % 2 == 0 else "0"
+                    elif edge_ratio < 0.24:
+                        rgb = lerp_rgb(rgb, (255, 255, 255), 0.25)
+                        ch = "O" if u < 0.62 else "o"
+                    else:
+                        ch = "0" if (ui + vi) % 3 == 0 else "o"
+
+                if (ui * 19 + (vi + 9) * 31 + k * 13 + shimmer_tick) % 73 == 0:
+                    rgb = lerp_rgb(rgb, (255, 255, 255), 0.5)
+                    ch = "*"
+
+                rgb = scale_rgb(rgb, shade)
+                cv.put(sx, sy, ch, rgb, 5.1 + rz + (0.02 if is_inner else 0.0))
+
+    sx, sy, rz, shade = project(
+        fx + fwd[0] * 0.03, fy + fwd[1] * 0.03, fz + fwd[2] * 0.03, rot_c, rot_s, cx, cy, unit
+    )
+    cv.put(sx, sy, "@", scale_rgb(throat_col, shade), 5.16 + rz)
+
+    stamen_prog = smoothstep((bloom - 0.35) / 0.65)
+    if stamen_prog > 0.05:
+        s_len = petal_len * 0.62 * stamen_prog
+        s_steps = max(5, int(s_len * unit * 1.8))
+        for i in range(5):
+            ang = i * (math.tau / 5.0) + 0.35 + math.sin(t_now * 1.8 + i) * 0.06
+            ca, sa = math.cos(ang), math.sin(ang)
+            s_rad = (
+                right[0] * ca + up[0] * sa,
+                right[1] * ca + up[1] * sa,
+                right[2] * ca + up[2] * sa,
+            )
+            for st in range(1, s_steps + 1):
+                u = st / s_steps
+                fd = s_len * (0.92 * u)
+                rd = s_len * 0.36 * (u ** 1.4)
+                px = fx + fwd[0] * fd + s_rad[0] * rd
+                py = fy + fwd[1] * fd + s_rad[1] * rd
+                pz = fz + fwd[2] * fd + s_rad[2] * rd
+                sx, sy, rz, shade = project(px, py, pz, rot_c, rot_s, cx, cy, unit)
+                if st < s_steps:
+                    f_col = scale_rgb(lerp_rgb(throat_col, (245, 250, 220), u), shade)
+                    cv.put(sx, sy, "|", f_col, 5.18 + rz)
+                else:
+                    pulse = 0.5 + 0.5 * math.sin(t_now * 4.5 + i * 1.7)
+                    a_col = scale_rgb(lerp_rgb(pal["anther"], pal["anther_hi"], pulse), shade)
+                    a_ch = "0" if pulse > 0.45 else "@"
+                    cv.put(sx, sy, a_ch, a_col, 5.22 + rz)
+
+
+def draw_bud_3d(cv, center, axis, size, growth, pal, rot_c, rot_s, cx, cy, unit):
+    """Draw a slender 3D pointed lily bud."""
+    if growth <= 0.05:
+        return
+    fx, fy, fz = center
+    fwd = vec_norm(axis)
+    length = size * growth
+    steps = max(8, int(length * unit * 2.2))
+    for i in range(steps + 1):
+        u = i / steps
+        px = fx + fwd[0] * length * u
+        py = fy + fwd[1] * length * u
+        pz = fz + fwd[2] * length * u
+        sx, sy, rz, shade = project(px, py, pz, rot_c, rot_s, cx, cy, unit)
+        if u < 0.35:
+            rgb = (120, 225, 145)
+            ch = "o"
+        elif u < 0.82:
+            rgb = lerp_rgb(pal["inner"], pal["edge"], (u - 0.35) / 0.47)
+            ch = "0"
+        else:
+            rgb = pal["edge"]
+            ch = "^" if fwd[1] < -0.5 else "*"
+        rgb = scale_rgb(rgb, shade)
+        cv.put(sx, sy, ch, rgb, 5.12 + rz)
+        if 0.2 < u < 0.65:
+            cv.put(sx + 1, sy, "o", scale_rgb(rgb, 0.85), 5.10 + rz)
+
+
+def draw_ambient(cv, stars, hearts, sparkles, drifters, t_now):
+    w, h = cv.w, cv.h
+
+    for sx_f, sy_f, phase, ch in sparkles:
+        twinkle = 0.45 + 0.55 * math.sin(t_now * 2.4 + phase)
+        if twinkle < 0.25:
+            continue
+        x = int(sx_f * w)
+        y = int(sy_f * h)
+        col = scale_rgb((220, 232, 250), twinkle)
+        cv.put(x, y, ch, col, 1.0)
+        if ch == "o" and twinkle > 0.6:
+            cv.put(x + 2, y, ".", scale_rgb((185, 200, 225), twinkle * 0.75), 1.0)
+
+    for sx_f, sy_f, phase, base_col in stars:
+        pulse = 0.55 + 0.45 * math.sin(t_now * 3.0 + phase)
+        x = int(sx_f * w)
+        y = int(sy_f * h)
+        hi = lerp_rgb(base_col, (255, 255, 255), pulse * 0.45)
+        arm = scale_rgb(base_col, 0.6 + 0.4 * pulse)
+        cv.put(x, y, "+", hi, 1.5)
+        if pulse > 0.35:
+            cv.put(x, y - 1, "|", arm, 1.5)
+            cv.put(x, y + 1, "|", arm, 1.5)
+            cv.put(x - 2, y, "-", arm, 1.5)
+            cv.put(x + 2, y, "-", arm, 1.5)
+        if pulse > 0.82:
+            cv.put(x - 1, y, ".", hi, 1.4)
+            cv.put(x + 1, y, ".", hi, 1.4)
+
+    for h_obj in hearts:
+        y_norm = (h_obj["y"] - t_now * h_obj["speed"]) % 0.88 + 0.04
+        x_norm = h_obj["x"] + math.sin(t_now * 1.1 + h_obj["phase"]) * 0.015
+        x = int(x_norm * w)
+        y = int(y_norm * h)
+        glow = 0.75 + 0.25 * math.sin(t_now * 3.2 + h_obj["phase"])
+        col = scale_rgb((255, 110, 170), glow)
+        for i, c in enumerate("(V)"):
+            cv.put(x - 1 + i, y, c, col, 2.0)
+        cv.put(x, y + 1, "V", scale_rgb(col, 0.9), 2.0)
+
+    for d in drifters:
+        x_norm = (d["x"] + t_now * d["vx"]) % 1.0
+        y_norm = d["y"] + math.sin(t_now * 1.6 + d["phase"]) * 0.02
+        cv.put(int(x_norm * w), int(y_norm * h), d["ch"], d["color"], 1.3)
+
+
+def draw_message(cv, text, t_now, reveal, pal):
+    if not text or reveal <= 0.0:
+        return
+    msg_y = cv.h - 2
+    cx = cv.w // 2
+    shown_len = int(len(text) * clamp(reveal, 0.0, 1.0))
+    shown = text[:shown_len]
+    start_x = cx - len(text) // 2
+
+    pulse = 0.82 + 0.18 * math.sin(t_now * 2.8)
+    base_col = scale_rgb(pal["msg"], pulse)
+    dim_col = scale_rgb(pal["msg"], 0.45 * pulse)
+
+    for i in range(len(text)):
+        if (i + int(t_now * 5)) % 4 != 0:
+            if msg_y - 1 >= 0:
+                cv.put(start_x + i, msg_y - 1, ":" if i % 3 == 0 else ".", dim_col, 20.0)
+            if msg_y + 1 < cv.h:
+                cv.put(start_x + i, msg_y + 1, "." if i % 2 == 0 else ":", dim_col, 20.0)
+
+    for i, ch in enumerate(shown):
+        glow = lerp_rgb(base_col, (255, 230, 245), 0.35 if (i - int(t_now * 8)) % 9 == 0 else 0.0)
+        cv.put(start_x + i, msg_y, ch, glow, 20.5)
+
+
+def build_bouquet_3d():
+    """Create a balanced 360-degree 3D bouquet of lilies and buds."""
+    lilies = [
+        ((0.0, -0.45, 0.0), (0.18, -0.92, 0.34), 0.31, 1.3, False),
+    ]
+
+    for i in range(3):
+        ang = i * (math.tau / 3.0) + 0.35
+        r = 0.47
+        cx, cz = math.cos(ang) * r, math.sin(ang) * r
+        axis = (math.cos(ang) * 0.72, -0.68, math.sin(ang) * 0.72)
+        lilies.append(((cx, -0.25, cz), axis, 0.26, 1.7 + i * 0.18, False))
+
+    for i in range(3):
+        ang = i * (math.tau / 3.0) + 0.35 + math.pi / 3.0
+        r = 0.64
+        cx, cz = math.cos(ang) * r, math.sin(ang) * r
+        axis = (math.cos(ang) * 0.86, -0.46, math.sin(ang) * 0.86)
+        lilies.append(((cx, 0.02, cz), axis, 0.22, 2.2 + i * 0.18, True))
+
+    buds = []
+    for i in range(3):
+        ang = i * (math.tau / 3.0) + 0.35 + math.pi / 3.0
+        r = 0.27
+        bx, bz = math.cos(ang) * r, math.sin(ang) * r
+        axis = (math.cos(ang) * 0.42, -0.90, math.sin(ang) * 0.42)
+        buds.append(((bx, -0.52, bz), axis, 0.18, 1.5 + i * 0.12))
+
+    return lilies, buds
+
+
+def main():
+    os.system("") 
+    pal = PALETTES.get(PALETTE, PALETTES["stargazer"])
+    stars, hearts, sparkles, drifters = make_particles()
+    lilies, buds = build_bouquet_3d()
+    base = (0.0, 0.78, 0.0)
+
+    sys.stdout.write("\x1b[?25l\x1b[2J")
+    sys.stdout.flush()
+    start_time = time.monotonic()
+
+    try:
+        while True:
+            frame_start = time.monotonic()
+            t_now = frame_start - start_time
+
+            cols, lines = shutil.get_terminal_size((100, 36))
+            w = max(48, cols)
+            h = max(20, lines - 1)
+
+            cv = Canvas(w, h)
+            cx = w * 0.5
+            cy = h * 0.48
+            unit = min((w - 6) / 3.6, (h - 5) / 1.85)
+
+            rot = t_now * ROTATION_SPEED
+            rot_c = math.cos(rot)
+            rot_s = math.sin(rot)
+            bob = math.sin(t_now * 1.4) * 0.015
+
+            stem_prog = smoothstep(t_now / 1.7)
+            leaf_prog = smoothstep((t_now - 0.35) / 1.8)
+            msg_prog = smoothstep((t_now - 2.4) / 1.7)
+
+            draw_ambient(cv, stars, hearts, sparkles, drifters, t_now)
+
+            draw_v_foliage_3d(cv, base, leaf_prog, t_now, rot_c, rot_s, cx, cy, unit)
+
+            for (bx, by, bz), baxis, bsize, bdelay in buds:
+                target = (bx, by + bob, bz)
+                ctrl = (bx * 0.42, lerp(base[1], target[1], 0.52), bz * 0.42)
+                draw_stem_3d(cv, base, ctrl, target, stem_prog, rot_c, rot_s, cx, cy, unit)
+                bud_g = smoothstep((t_now - bdelay) / 1.1)
+                draw_bud_3d(cv, target, baxis, bsize, bud_g, pal, rot_c, rot_s, cx, cy, unit)
+
+            for (lx, ly, lz), laxis, lsize, ldelay, is_acc in lilies:
+                target = (lx, ly + bob, lz)
+                ctrl = (lx * 0.38, lerp(base[1], target[1], 0.48), lz * 0.38)
+                draw_stem_3d(cv, base, ctrl, target, stem_prog, rot_c, rot_s, cx, cy, unit)
+
+                bloom = smoothstep((t_now - ldelay) / 1.4)
+                draw_lily_3d(
+                    cv,
+                    target,
+                    laxis,
+                    lsize,
+                    bloom,
+                    pal,
+                    t_now,
+                    rot_c,
+                    rot_s,
+                    cx,
+                    cy,
+                    unit,
+                    accent=is_acc,
+                )
+
+            # 5. Glowing bottom message
+            draw_message(cv, MESSAGE, t_now, msg_prog, pal)
+
+            sys.stdout.write(cv.render())
+            sys.stdout.flush()
+
+            elapsed = time.monotonic() - frame_start
+            sleep_time = (1.0 / FPS) - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\x1b[0m\x1b[?25h\n")
+        sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    main()
